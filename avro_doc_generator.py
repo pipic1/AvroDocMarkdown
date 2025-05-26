@@ -3,6 +3,7 @@ import json
 import os
 import argparse
 from typing import Dict, Any, List
+import re
 
 class AvroDocumentationGenerator:
     def __init__(self, avro_file_path: str, output_dir: str = 'docs'):
@@ -151,7 +152,13 @@ class AvroDocumentationGenerator:
         :return: Type pour le diagramme Mermaid
         """
         if isinstance(field_type, list):
-            return ' | '.join([self._get_single_mermaid_type(t) for t in field_type])
+            # Check for nullable type: union of "null" and one other type
+            if len(field_type) == 2 and "null" in field_type:
+                other_type = [t for t in field_type if t != "null"][0]
+                return f"{self._get_single_mermaid_type(other_type)}?"
+            else:
+                # Default handling for other unions
+                return ' | '.join([self._get_single_mermaid_type(t) for t in field_type])
         return self._get_single_mermaid_type(field_type)
 
     def _get_single_mermaid_type(self, type_schema: Any) -> str:
@@ -162,6 +169,7 @@ class AvroDocumentationGenerator:
         :return: Type Mermaid
         """
         if isinstance(type_schema, str):
+            # Primitive types like "string", "int", "boolean"
             return type_schema
         
         if hasattr(type_schema, 'type'):
@@ -170,10 +178,13 @@ class AvroDocumentationGenerator:
             elif type_schema.type == 'enum':
                 return f"{type_schema.name}"
             elif type_schema.type == 'array':
-                return f"List<{self._get_single_mermaid_type(type_schema.items)}>"
+                # Use _get_mermaid_field_type for items to handle nested nullability (e.g., List<MyType?>)
+                return f"List<{self._get_mermaid_field_type(type_schema.items)}>"
             elif type_schema.type == 'map':
-                return f"Map<{self._get_single_mermaid_type(type_schema.values)}>"
+                # Use _get_mermaid_field_type for values to handle nested nullability
+                return f"Map<{self._get_mermaid_field_type(type_schema.values)}>"
         
+        # Fallback for any other complex type structure not explicitly handled
         return str(type_schema)
 
 
@@ -239,6 +250,16 @@ class AvroDocumentationGenerator:
                 doc += "**Valeurs possibles**:\n"
                 doc += "\n".join([f"- `{symbol}`" for symbol in enum_schema.symbols])
                 doc += "\n\n"
+        
+        # Section Conseils et Bonnes Pratiques
+        doc += "\n## Conseils et Bonnes Pratiques\n\n"
+        advice_list = self._detect_bad_practices()
+        if advice_list:
+            for advice in advice_list:
+                doc += f"- {advice}\n"
+            doc += "\n"
+        else:
+            doc += "Aucune mauvaise pratique notable détectée.\n\n"
 
         return doc
 
@@ -341,7 +362,13 @@ class AvroDocumentationGenerator:
         """
         # Gestion des types union
         if isinstance(field_type, list):
-            return ' ou '.join([self._get_single_type_name(t) for t in field_type])
+            # Check for nullable type: union of "null" and one other type
+            if len(field_type) == 2 and "null" in field_type:
+                other_type = [t for t in field_type if t != "null"][0]
+                return f"{self._get_single_type_name(other_type)} (nullable)"
+            else:
+                # Default handling for other unions
+                return ' ou '.join([self._get_single_type_name(t) for t in field_type])
         
         # Gestion des types simples et complexes
         return self._get_single_type_name(field_type)
@@ -358,13 +385,15 @@ class AvroDocumentationGenerator:
         
         if hasattr(type_schema, 'type'):
             if type_schema.type == 'record':
-                return f"Record ({type_schema.name})"
+                return f"record<{type_schema.name}>"
             elif type_schema.type == 'enum':
-                return f"Enum ({type_schema.name})"
+                return f"enum<{type_schema.name}>"
             elif type_schema.type == 'array':
-                return f"Tableau de {self._get_single_type_name(type_schema.items)}"
+                # Use _get_field_type for items to handle nested nullability correctly
+                return f"array<{self._get_field_type(type_schema.items)}>"
             elif type_schema.type == 'map':
-                return f"Map de {self._get_single_type_name(type_schema.values)}"
+                # Use _get_field_type for values to handle nested nullability correctly
+                return f"map<{self._get_field_type(type_schema.values)}>"
         
         return str(type_schema)
 
@@ -381,6 +410,139 @@ class AvroDocumentationGenerator:
             f.write(content)
         
         print(f"Documentation générée : {output_file}")
+
+    def _detect_bad_practices(self) -> List[str]:
+        """
+        Analyse le schéma Avro chargé et identifie les mauvaises pratiques potentielles.
+        Retourne une liste de chaînes descriptives des problèmes trouvés.
+        """
+        bad_practices: List[str] = []
+
+        # S'assurer que _extract_nested_types a été appelé
+        if not self.records and not self.enums and self.schema.type == 'record':
+            # Appel préliminaire si les structures ne sont pas remplies.
+            # Cela est important si _detect_bad_practices est appelé indépendamment.
+            self._extract_nested_types(self.schema)
+
+        # 1. Documentation Manquante
+        all_records_to_check: Dict[str, Any] = {}
+        if self.schema.type == 'record':
+            all_records_to_check[self.schema.name] = self.schema
+        all_records_to_check.update(self.records)
+
+        # Documentation du schéma principal
+        if self.schema.type == 'record' and not self.schema.props.get('doc'):
+            bad_practices.append(f"Le schéma principal '{self.schema.name}' n'a pas de documentation ('doc').")
+        elif self.schema.type != 'record' and not self.schema.props.get('doc'): # Pour les schémas non-record (ex: juste un type array ou map en root)
+             # Tenter de trouver un nom, sinon utiliser le type.
+            schema_name = getattr(self.schema, 'name', self.schema.type)
+            bad_practices.append(f"Le schéma principal '{schema_name}' n'a pas de documentation ('doc').")
+
+
+        # Documentation des records et de leurs champs
+        for record_name, record_schema in all_records_to_check.items():
+            if not record_schema.props.get('doc'):
+                bad_practices.append(f"Le record '{record_name}' n'a pas de documentation.")
+            
+            for field in record_schema.fields:
+                if not field.props.get('doc'):
+                    bad_practices.append(f"Le champ '{field.name}' dans le record '{record_name}' n'a pas de documentation.")
+
+        # Documentation des enums
+        for enum_name, enum_schema in self.enums.items():
+            if not enum_schema.props.get('doc'):
+                bad_practices.append(f"L'enum '{enum_name}' n'a pas de documentation.")
+
+        # 2. Noms Génériques
+        GENERIC_RECORD_NAMES = {"Record", "NewRecord", "MyRecord", "Schema", "AvroSchema", "DataStructure"}
+        GENERIC_FIELD_NAMES = {"field", "data", "value", "item", "entry", "key", "type", "name", "content", "payload", "details"}
+        GENERIC_ENUM_NAMES = {"Enum", "MyEnum", "EnumType", "Option"}
+
+        # Noms génériques pour les records
+        for record_name in all_records_to_check.keys():
+            if record_name in GENERIC_RECORD_NAMES:
+                bad_practices.append(f"Le record '{record_name}' a un nom générique.")
+
+        # Noms génériques pour les champs
+        for record_name, record_schema in all_records_to_check.items():
+            for field in record_schema.fields:
+                if field.name in GENERIC_FIELD_NAMES:
+                    bad_practices.append(f"Le champ '{field.name}' dans le record '{record_name}' a un nom générique.")
+        
+        # Noms génériques pour les enums
+        for enum_name in self.enums.keys():
+            if enum_name in GENERIC_ENUM_NAMES:
+                bad_practices.append(f"L'enum '{enum_name}' a un nom générique.")
+        
+        # 3. Conventions des Symboles d'Enum
+        for enum_name, enum_schema in self.enums.items():
+            for symbol in enum_schema.symbols:
+                if len(symbol) < 3:
+                    bad_practices.append(f"Le symbole '{symbol}' dans l'enum '{enum_name}' est trop court (moins de 3 caractères).")
+                if not re.match(r"^[A-Z0-9_]+$", symbol):
+                    bad_practices.append(f"Le symbole '{symbol}' dans l'enum '{enum_name}' n'est pas en UPPER_SNAKE_CASE (ex: MY_SYMBOL).")
+
+        # 4. Valeurs par Défaut pour les Champs Union
+        for record_name, record_schema in all_records_to_check.items():
+            for field in record_schema.fields:
+                # field.type est un avro.schema.Schema object
+                # Si c'est une union, field.type sera un avro.schema.UnionSchema
+                if isinstance(field.type, avro.schema.UnionSchema):
+                    if hasattr(field, 'has_default') and field.has_default:
+                        # La valeur par défaut doit correspondre au premier type de l'union.
+                        first_type_in_union = field.type.schemas[0]
+                        
+                        # Convertir le nom du type avro.schema en string simple
+                        first_type_name = None
+                        if isinstance(first_type_in_union, avro.schema.PrimitiveSchema):
+                            first_type_name = first_type_in_union.type # e.g., "null", "string"
+                        elif isinstance(first_type_in_union, avro.schema.NamedSchema):
+                             first_type_name = first_type_in_union.name # e.g., "MyRecord"
+                        else: # Pour les types complexes non nommés comme array, map
+                            first_type_name = first_type_in_union.type
+
+
+                        # Cas 1: La valeur par défaut est None (null JSON), mais le premier type n'est pas "null"
+                        if field.default is None or field.default == avro.schema.NULL: # avro.schema.NULL est la représentation interne pour un défaut JSON null
+                            if first_type_name != "null":
+                                bad_practices.append(
+                                    f"Le champ '{field.name}' dans le record '{record_name}' est une union avec une valeur par défaut 'null', "
+                                    f"mais son premier type n'est pas 'null' (il est '{first_type_name}'). "
+                                    "La valeur par défaut doit correspondre au premier type de l'union."
+                                )
+                        # Cas 2 (moins direct, mais important): Le premier type est 'null', mais la valeur par défaut n'est pas None/avro.schema.NULL
+                        # Ceci est généralement une erreur de schéma car une valeur non-nulle ne peut pas être assignée à un type 'null'.
+                        # L'analyseur avro.schema.parse devrait normalement attraper ça, mais une vérification peut être utile.
+                        elif first_type_name == "null" and field.default is not None and field.default != avro.schema.NULL:
+                             bad_practices.append(
+                                    f"Le champ '{field.name}' dans le record '{record_name}' est une union dont le premier type est 'null', "
+                                    f"mais sa valeur par défaut ('{field.default}') n'est pas 'null'. "
+                                    "Cela contredit la règle selon laquelle la valeur par défaut doit correspondre au premier type."
+                                )
+                        # Cas 3: Le premier type n'est pas 'null', et la valeur par défaut n'est pas 'null'.
+                        # Il faut vérifier que la valeur par défaut est valide pour ce premier type.
+                        # Cette validation est complexe et généralement gérée par l'analyseur Avro.
+                        # Pour cette fonction, nous nous concentrons sur la règle "null" en premier.
+                        # Cependant, si le premier type n'est pas 'null' et qu'une valeur par défaut est fournie,
+                        # on peut au moins mentionner que 'null' devrait être le premier type si l'intention est l'optionnalité.
+                        elif first_type_name != "null" and (field.default is not None and field.default != avro.schema.NULL) :
+                             # Check if the default value is compatible with the first_type_name
+                             # This is a more subtle point: Avro allows default for non-null first type if it matches.
+                             # But the spirit of ["null", "X"] with default is usually to make X optional.
+                             # If first_type_name is not "null", but a default is provided, it implies the field is not truly "optional" in the common sense.
+                             # For now, we'll stick to the problem description's focus.
+                             # The prompt asks to flag if "null" is not the first type when a default is present.
+                             # This implicitly covers the case where default is None and first type is not "null".
+                             # And if default is something else, and first type is not "null", it's valid Avro,
+                             # but might be against a "best practice" if nullability was the goal.
+                             # The most direct interpretation of the request is: "If a field is a union with a default, and 'null' is not its first type"
+                             bad_practices.append(
+                                 f"Le champ '{field.name}' dans le record '{record_name}' est une union avec une valeur par défaut. "
+                                 f"Pour indiquer clairement l'optionnalité, 'null' devrait être le premier type dans l'union. Le premier type actuel est '{first_type_name}'."
+                             )
+
+
+        return bad_practices
 
 def main():
     parser = argparse.ArgumentParser(description='Générateur de documentation Avro')
